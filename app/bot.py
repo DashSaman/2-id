@@ -43,7 +43,14 @@ def main_keyboard():
 
 
 def confirm_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ ثبت سفارش", callback_data="order_confirm"), InlineKeyboardButton(text="❌ لغو", callback_data="order_cancel")]])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ ثبت سفارش", callback_data="order_confirm"),
+                InlineKeyboardButton(text="❌ لغو", callback_data="order_cancel"),
+            ]
+        ]
+    )
 
 
 def _ensure_tg_user(tg_id: int, username: str | None):
@@ -69,12 +76,13 @@ async def wallet(message: Message):
 async def orders(message: Message):
     user_id, _, _ = _ensure_tg_user(message.from_user.id, message.from_user.username)
     with SF() as session:
-        rows = session.scalars(select(Order).where(Order.user_id == user_id).order_by(Order.created_at.desc()).limit(10)).all()
+        rows = session.scalars(
+            select(Order).where(Order.user_id == user_id).order_by(Order.created_at.desc()).limit(10)
+        ).all()
     if not rows:
         await message.answer("هنوز سفارشی ندارید.")
         return
-    await message.answer("
-".join(f"{o.id[:8]} | {o.email_masked} | {o.status}" for o in rows))
+    await message.answer("\n".join(f"{o.id[:8]} | {o.email_masked} | {o.status}" for o in rows))
 
 
 async def support(message: Message):
@@ -120,13 +128,13 @@ async def get_last_name(message: Message, state: FSMContext):
     await state.update_data(last_name=(message.text or "").strip())
     data = await state.get_data()
     await state.set_state(CreateFlow.confirm)
-    await message.answer(
-        f"ایمیل: {data['email']}
-نام: {data['first_name']} {data['last_name']}
-قیمت: {settings.apple_account_price:,} {settings.currency}
-پسورد نمایش داده نمی‌شود.",
-        reply_markup=confirm_keyboard(),
+    summary = (
+        f"ایمیل: {data['email']}\n"
+        f"نام: {data['first_name']} {data['last_name']}\n"
+        f"قیمت: {settings.apple_account_price:,} {settings.currency}\n"
+        "پسورد نمایش داده نمی‌شود."
     )
+    await message.answer(summary, reply_markup=confirm_keyboard())
 
 
 async def confirm(callback: CallbackQuery, state: FSMContext):
