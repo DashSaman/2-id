@@ -11,6 +11,7 @@ class Settings:
     encryption_key: str
     admin_api_key: str
     partner_key_pepper: str
+    worker_api_key: str
     apple_account_price: int
     currency: str
     apple_provider: str
@@ -45,6 +46,7 @@ def get_settings() -> Settings:
     encryption_key = os.getenv("APP_ENCRYPTION_KEY", "")
     admin_key = os.getenv("ADMIN_API_KEY", "")
     pepper = os.getenv("PARTNER_KEY_PEPPER", "")
+    worker_key = os.getenv("WORKER_API_KEY", "")
     if env.lower() == "production":
         missing = [
             name
@@ -53,6 +55,7 @@ def get_settings() -> Settings:
                 "APP_ENCRYPTION_KEY": encryption_key,
                 "ADMIN_API_KEY": admin_key,
                 "PARTNER_KEY_PEPPER": pepper,
+                "WORKER_API_KEY": worker_key,
             }.items()
             if not value
         ]
@@ -66,6 +69,7 @@ def get_settings() -> Settings:
         encryption_key=encryption_key,
         admin_api_key=admin_key,
         partner_key_pepper=pepper,
+        worker_api_key=worker_key,
         apple_account_price=int(os.getenv("APPLE_ACCOUNT_PRICE", "100000")),
         currency=os.getenv("CURRENCY", "IRR"),
         apple_provider=os.getenv("APPLE_PROVIDER", "mock"),
