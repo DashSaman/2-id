@@ -2,20 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
-from sqlalchemy import select
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
+from sqlalchemy import func, select
 
 from .config import get_settings
 from .crypto import PayloadCrypto
 from .db import make_engine, make_session_factory
 from .logging import configure_logging
-from .models import Order, Wallet
+from .models import AuditLog, LedgerEntry, Order, User, Wallet
 from .orders import create_apple_order, create_or_get_user
-from .wallet import InsufficientBalance, ensure_wallet
+from .wallet import InsufficientBalance, adjust_wallet, ensure_wallet
 
 log = logging.getLogger("twoid.bot")
 settings = get_settings()
@@ -32,14 +41,23 @@ class CreateFlow(StatesGroup):
     confirm = State()
 
 
-def main_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🍎 ساخت Apple ID"), KeyboardButton(text="💰 کیف پول")],
-            [KeyboardButton(text="📦 سفارش‌های من"), KeyboardButton(text="🛟 پشتیبانی")],
-        ],
-        resize_keyboard=True,
-    )
+class AdminAdjustFlow(StatesGroup):
+    target_user = State()
+    amount = State()
+
+
+def is_admin(user_id: int | None) -> bool:
+    return settings.is_admin(user_id)
+
+
+def main_keyboard(user_id: int | None = None):
+    rows = [
+        [KeyboardButton(text="🍎 ساخت Apple ID"), KeyboardButton(text="💰 کیف پول")],
+        [KeyboardButton(text="📦 سفارش‌های من"), KeyboardButton(text="🛟 پشتیبانی")],
+    ]
+    if is_admin(user_id):
+        rows.append([KeyboardButton(text="🛠 مدیریت")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def confirm_keyboard():
@@ -53,6 +71,25 @@ def confirm_keyboard():
     )
 
 
+def admin_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📊 آمار", callback_data="admin_stats"),
+                InlineKeyboardButton(text="👥 کاربران", callback_data="admin_users"),
+            ],
+            [
+                InlineKeyboardButton(text="📦 سفارش‌ها", callback_data="admin_orders"),
+                InlineKeyboardButton(text="💳 شارژ کیف پول", callback_data="admin_credit"),
+            ],
+            [
+                InlineKeyboardButton(text="➖ کسر از کیف پول", callback_data="admin_debit"),
+                InlineKeyboardButton(text="💰 کیف پول من", callback_data="admin_self_wallet"),
+            ],
+        ]
+    )
+
+
 def _ensure_tg_user(tg_id: int, username: str | None):
     with SF() as session:
         user = create_or_get_user(session, tg_id, username, settings.currency)
@@ -61,9 +98,25 @@ def _ensure_tg_user(tg_id: int, username: str | None):
         return user.id, wallet.id, wallet.balance
 
 
+def _admin_required(user_id: int | None) -> None:
+    if not is_admin(user_id):
+        raise PermissionError("admin_required")
+
+
+def _find_user_and_wallet(session, telegram_id: int):
+    user = session.scalar(select(User).where(User.telegram_id == telegram_id))
+    if not user:
+        return None, None
+    wallet = ensure_wallet(session, user, settings.currency)
+    return user, wallet
+
+
 async def start(message: Message):
     _ensure_tg_user(message.from_user.id, message.from_user.username)
-    await message.answer("به ربات مرجع 2-id خوش آمدید.", reply_markup=main_keyboard())
+    text = "به ربات مرجع 2-id خوش آمدید."
+    if is_admin(message.from_user.id):
+        text += "\n\n✅ دسترسی مدیریت برای حساب شما فعال است."
+    await message.answer(text, reply_markup=main_keyboard(message.from_user.id))
 
 
 async def wallet(message: Message):
@@ -164,30 +217,239 @@ async def confirm(callback: CallbackQuery, state: FSMContext):
             msg = "❌ موجودی کیف پول کافی نیست."
     await state.clear()
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(msg, reply_markup=main_keyboard())
+    await callback.message.answer(msg, reply_markup=main_keyboard(callback.from_user.id))
     await callback.answer()
 
 
 async def cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("سفارش لغو شد.", reply_markup=main_keyboard())
+    await callback.message.answer("سفارش لغو شد.", reply_markup=main_keyboard(callback.from_user.id))
     await callback.answer()
+
+
+async def admin_menu(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("دسترسی مدیریت ندارید.")
+        return
+    await message.answer("🛠 پنل مدیریت 2-id", reply_markup=admin_keyboard())
+
+
+async def admin_stats(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    with SF() as session:
+        users_count = session.scalar(select(func.count()).select_from(User)) or 0
+        orders_count = session.scalar(select(func.count()).select_from(Order)) or 0
+        pending_count = session.scalar(select(func.count()).select_from(Order).where(Order.status.in_(["PENDING", "PROCESSING"]))) or 0
+        wallet_total = session.scalar(select(func.coalesce(func.sum(Wallet.balance), 0))) or 0
+    text = (
+        "📊 آمار سیستم\n\n"
+        f"👥 کاربران: {users_count}\n"
+        f"📦 کل سفارش‌ها: {orders_count}\n"
+        f"⏳ درحال پردازش: {pending_count}\n"
+        f"💰 مجموع موجودی کیف پول‌ها: {wallet_total:,} {settings.currency}\n"
+        f"💵 قیمت فعلی: {settings.apple_account_price:,} {settings.currency}"
+    )
+    await callback.message.answer(text, reply_markup=admin_keyboard())
+    await callback.answer()
+
+
+async def admin_users(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    with SF() as session:
+        rows = session.execute(
+            select(User.telegram_id, User.username, Wallet.balance, Wallet.currency)
+            .join(Wallet, Wallet.user_id == User.id)
+            .order_by(User.created_at.desc())
+            .limit(30)
+        ).all()
+    if not rows:
+        text = "کاربری ثبت نشده است."
+    else:
+        lines = ["👥 آخرین کاربران:"]
+        for telegram_id, username, balance, currency in rows:
+            name = f"@{username}" if username else "بدون یوزرنیم"
+            admin_mark = " 👑" if is_admin(telegram_id) else ""
+            lines.append(f"{telegram_id} | {name}{admin_mark} | {balance:,} {currency}")
+        text = "\n".join(lines)
+    await callback.message.answer(text, reply_markup=admin_keyboard())
+    await callback.answer()
+
+
+async def admin_orders(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    with SF() as session:
+        rows = session.execute(
+            select(Order.id, Order.owner_type, Order.owner_id, Order.email_masked, Order.status, Order.price, Order.refunded)
+            .order_by(Order.created_at.desc())
+            .limit(30)
+        ).all()
+    if not rows:
+        text = "هنوز سفارشی ثبت نشده است."
+    else:
+        lines = ["📦 آخرین سفارش‌ها:"]
+        for oid, owner_type, owner_id, email, status, price, refunded in rows:
+            refund = " | refund" if refunded else ""
+            lines.append(f"{oid[:8]} | {owner_type}:{owner_id} | {email} | {status} | {price:,}{refund}")
+        text = "\n".join(lines)
+    await callback.message.answer(text, reply_markup=admin_keyboard())
+    await callback.answer()
+
+
+async def admin_self_wallet(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    _, wallet_id, _ = _ensure_tg_user(callback.from_user.id, callback.from_user.username)
+    with SF() as session:
+        wallet = session.get(Wallet, wallet_id)
+        rows = session.scalars(
+            select(LedgerEntry)
+            .where(LedgerEntry.wallet_id == wallet.id)
+            .order_by(LedgerEntry.created_at.desc())
+            .limit(10)
+        ).all()
+        lines = [f"💰 کیف پول شما: {wallet.balance:,} {wallet.currency}"]
+        for entry in rows:
+            lines.append(f"{entry.kind}: {entry.amount:+,}")
+    await callback.message.answer("\n".join(lines), reply_markup=admin_keyboard())
+    await callback.answer()
+
+
+async def admin_credit(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(admin_adjust_sign=1)
+    await state.set_state(AdminAdjustFlow.target_user)
+    await callback.message.answer("Telegram ID کاربر را برای شارژ وارد کنید:")
+    await callback.answer()
+
+
+async def admin_debit(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(admin_adjust_sign=-1)
+    await state.set_state(AdminAdjustFlow.target_user)
+    await callback.message.answer("Telegram ID کاربر را برای کسر موجودی وارد کنید:")
+    await callback.answer()
+
+
+async def admin_adjust_target(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        telegram_id = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Telegram ID باید عدد باشد.")
+        return
+    with SF() as session:
+        user, wallet = _find_user_and_wallet(session, telegram_id)
+        if not user:
+            await message.answer("کاربر پیدا نشد. ابتدا کاربر باید یک‌بار /start بزند.")
+            return
+        username = f"@{user.username}" if user.username else "بدون یوزرنیم"
+        balance = wallet.balance
+    await state.update_data(admin_target_id=telegram_id)
+    await state.set_state(AdminAdjustFlow.amount)
+    await message.answer(
+        f"کاربر: {telegram_id} | {username}\n"
+        f"موجودی فعلی: {balance:,} {settings.currency}\n"
+        "مبلغ را به‌صورت عدد صحیح وارد کنید:"
+    )
+
+
+async def admin_adjust_amount(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    try:
+        raw_amount = int((message.text or "").replace(",", "").strip())
+    except ValueError:
+        await message.answer("مبلغ باید عدد صحیح باشد.")
+        return
+    if raw_amount <= 0:
+        await message.answer("مبلغ باید بزرگ‌تر از صفر باشد.")
+        return
+    target_id = int(data["admin_target_id"])
+    sign = int(data["admin_adjust_sign"])
+    amount = raw_amount * sign
+    with SF() as session:
+        user, wallet = _find_user_and_wallet(session, target_id)
+        if not user or not wallet:
+            await state.clear()
+            await message.answer("کاربر دیگر وجود ندارد.")
+            return
+        try:
+            entry = adjust_wallet(
+                session,
+                wallet.id,
+                amount,
+                "ADMIN_ADJUSTMENT",
+                f"tg-admin:{message.from_user.id}:{target_id}:{time.time_ns()}",
+                reference=f"admin:{message.from_user.id}",
+            )
+        except InsufficientBalance:
+            session.rollback()
+            await message.answer("❌ موجودی کاربر برای این مقدار کسر کافی نیست.")
+            return
+        session.add(
+            AuditLog(
+                actor=f"telegram-admin:{message.from_user.id}",
+                action="wallet.adjust",
+                target=user.id,
+                detail=f"{amount:+d}",
+            )
+        )
+        session.commit()
+        balance = wallet.balance
+        entry_id = entry.id
+    await state.clear()
+    action = "شارژ" if amount > 0 else "کسر"
+    await message.answer(
+        f"✅ {action} انجام شد.\n"
+        f"Telegram ID: {target_id}\n"
+        f"مبلغ: {amount:+,} {settings.currency}\n"
+        f"موجودی جدید: {balance:,} {settings.currency}\n"
+        f"Ledger: {entry_id[:8]}",
+        reply_markup=main_keyboard(message.from_user.id),
+    )
 
 
 def build_dispatcher() -> Dispatcher:
     dp = Dispatcher()
     dp.message.register(start, CommandStart())
+    dp.message.register(admin_menu, Command("admin"))
     dp.message.register(begin_create, F.text == "🍎 ساخت Apple ID")
     dp.message.register(wallet, F.text == "💰 کیف پول")
     dp.message.register(orders, F.text == "📦 سفارش‌های من")
     dp.message.register(support, F.text == "🛟 پشتیبانی")
+    dp.message.register(admin_menu, F.text == "🛠 مدیریت")
     dp.message.register(get_email, CreateFlow.email)
     dp.message.register(get_password, CreateFlow.password)
     dp.message.register(get_first_name, CreateFlow.first_name)
     dp.message.register(get_last_name, CreateFlow.last_name)
+    dp.message.register(admin_adjust_target, AdminAdjustFlow.target_user)
+    dp.message.register(admin_adjust_amount, AdminAdjustFlow.amount)
     dp.callback_query.register(confirm, F.data == "order_confirm", CreateFlow.confirm)
     dp.callback_query.register(cancel, F.data == "order_cancel")
+    dp.callback_query.register(admin_stats, F.data == "admin_stats")
+    dp.callback_query.register(admin_users, F.data == "admin_users")
+    dp.callback_query.register(admin_orders, F.data == "admin_orders")
+    dp.callback_query.register(admin_credit, F.data == "admin_credit")
+    dp.callback_query.register(admin_debit, F.data == "admin_debit")
+    dp.callback_query.register(admin_self_wallet, F.data == "admin_self_wallet")
     return dp
 
 
