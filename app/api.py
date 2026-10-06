@@ -15,12 +15,14 @@ from .orders import IdempotencyConflict, create_apple_order, create_or_get_user
 from .partners import create_partner, partner_synthetic_telegram_id
 from .schemas import AppleOrderCreate, PartnerCreate, PartnerWalletAdjust, WalletAdjust
 from .wallet import InsufficientBalance, adjust_wallet, ensure_wallet
+from .external_worker import router as external_worker_router
 
 settings = get_settings()
 engine = make_engine(settings.database_url)
 SessionFactory = make_session_factory(engine)
 crypto = PayloadCrypto(settings.encryption_key) if settings.encryption_key else None
 app = FastAPI(title="2-id", version="0.1.0")
+app.include_router(external_worker_router)
 
 _rate = defaultdict(deque)
 _rate_lock = threading.Lock()
