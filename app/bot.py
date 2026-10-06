@@ -22,7 +22,7 @@ from .config import get_settings
 from .crypto import PayloadCrypto
 from .db import make_engine, make_session_factory
 from .logging import configure_logging
-from .models import AuditLog, LedgerEntry, Order, User, Wallet
+from .models import AppleChallenge, AppleJob, AuditLog, LedgerEntry, Order, User, Wallet, now_utc
 from .orders import create_apple_order, create_or_get_user
 from .wallet import InsufficientBalance, adjust_wallet, ensure_wallet
 
@@ -46,6 +46,11 @@ class AdminAdjustFlow(StatesGroup):
     amount = State()
 
 
+class EmailOtpFlow(StatesGroup):
+    order_id = State()
+    otp = State()
+
+
 def is_admin(user_id: int | None) -> bool:
     return settings.is_admin(user_id)
 
@@ -54,6 +59,7 @@ def main_keyboard(user_id: int | None = None):
     rows = [
         [KeyboardButton(text="🍎 ساخت Apple ID"), KeyboardButton(text="💰 کیف پول")],
         [KeyboardButton(text="📦 سفارش‌های من"), KeyboardButton(text="🛟 پشتیبانی")],
+        [KeyboardButton(text="📧 ثبت کد ایمیل")],
     ]
     if is_admin(user_id):
         rows.append([KeyboardButton(text="🛠 مدیریت")])
@@ -427,6 +433,104 @@ async def admin_adjust_amount(message: Message, state: FSMContext):
     )
 
 
+async def begin_email_otp(message: Message, state: FSMContext):
+    user_id, _, _ = _ensure_tg_user(message.from_user.id, message.from_user.username)
+    with SF() as session:
+        pending = session.scalars(
+            select(Order)
+            .where(Order.user_id == user_id, Order.status == "EMAIL_OTP_REQUIRED")
+            .order_by(Order.created_at.desc())
+            .limit(5)
+        ).all()
+    if not pending:
+        await message.answer("هیچ سفارشی منتظر کد تأیید ایمیل نیست.")
+        return
+    await state.clear()
+    if len(pending) == 1:
+        await state.update_data(email_otp_order_id=pending[0].id)
+        await state.set_state(EmailOtpFlow.otp)
+        await message.answer(
+            f"کد تأیید ایمیل سفارش {pending[0].id[:8]} را وارد کنید. "
+            "کد فقط یک‌بار و به‌صورت رمز‌شده نگهداری می‌شود:"
+        )
+        return
+    await state.set_state(EmailOtpFlow.order_id)
+    lines = ["چند سفارش منتظر کد هستند. ۸ کاراکتر اول شناسه سفارش را بفرستید:"]
+    lines.extend(f"{o.id[:8]} | {o.email_masked}" for o in pending)
+    await message.answer("\n".join(lines))
+
+
+async def email_otp_select_order(message: Message, state: FSMContext):
+    user_id, _, _ = _ensure_tg_user(message.from_user.id, message.from_user.username)
+    prefix = (message.text or "").strip().lower()
+    if len(prefix) < 6:
+        await message.answer("شناسه سفارش معتبر نیست.")
+        return
+    with SF() as session:
+        rows = session.scalars(
+            select(Order).where(Order.user_id == user_id, Order.status == "EMAIL_OTP_REQUIRED")
+        ).all()
+    matches = [o for o in rows if o.id.lower().startswith(prefix)]
+    if len(matches) != 1:
+        await message.answer("سفارش پیدا نشد یا شناسه مبهم است.")
+        return
+    await state.update_data(email_otp_order_id=matches[0].id)
+    await state.set_state(EmailOtpFlow.otp)
+    await message.answer("کد تأیید ایمیل را وارد کنید:")
+
+
+async def email_otp_submit(message: Message, state: FSMContext):
+    user_id, _, _ = _ensure_tg_user(message.from_user.id, message.from_user.username)
+    value = (message.text or "").strip().replace(" ", "")
+    if not value.isdigit() or not (4 <= len(value) <= 8):
+        await message.answer("کد باید ۴ تا ۸ رقم باشد.")
+        return
+    data = await state.get_data()
+    order_id = data.get("email_otp_order_id")
+    with SF() as session:
+        order = session.scalar(
+            select(Order).where(
+                Order.id == order_id,
+                Order.user_id == user_id,
+                Order.status == "EMAIL_OTP_REQUIRED",
+            )
+        )
+        if not order:
+            await state.clear()
+            await message.answer("این سفارش دیگر منتظر کد ایمیل نیست.")
+            return
+        job = session.scalar(select(AppleJob).where(AppleJob.order_id == order.id))
+        challenge = session.scalar(select(AppleChallenge).where(AppleChallenge.job_id == job.id))
+        if not challenge or challenge.kind != "email_otp":
+            await state.clear()
+            await message.answer("درخواست کد برای این سفارش معتبر نیست.")
+            return
+        if challenge.expires_at and challenge.expires_at < now_utc():
+            await state.clear()
+            await message.answer("مهلت این کد تمام شده است؛ Worker باید درخواست جدید ایجاد کند.")
+            return
+        challenge.encrypted_value = crypto.encrypt({"value": value})
+        challenge.consumed_at = None
+        session.add(
+            AuditLog(
+                actor=f"telegram-user:{message.from_user.id}",
+                action="apple.email_otp.submit",
+                target=order.id,
+                detail="encrypted",
+            )
+        )
+        session.commit()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await state.clear()
+    await message.answer(
+        "✅ کد ایمیل رمزگذاری و برای Worker ارسال شد. خود کد در تاریخچه سفارش نمایش داده نمی‌شود.",
+        reply_markup=main_keyboard(message.from_user.id),
+    )
+
+
 def build_dispatcher() -> Dispatcher:
     dp = Dispatcher()
     dp.message.register(start, CommandStart())
@@ -435,6 +539,7 @@ def build_dispatcher() -> Dispatcher:
     dp.message.register(wallet, F.text == "💰 کیف پول")
     dp.message.register(orders, F.text == "📦 سفارش‌های من")
     dp.message.register(support, F.text == "🛟 پشتیبانی")
+    dp.message.register(begin_email_otp, F.text == "📧 ثبت کد ایمیل")
     dp.message.register(admin_menu, F.text == "🛠 مدیریت")
     dp.message.register(get_email, CreateFlow.email)
     dp.message.register(get_password, CreateFlow.password)
@@ -442,6 +547,8 @@ def build_dispatcher() -> Dispatcher:
     dp.message.register(get_last_name, CreateFlow.last_name)
     dp.message.register(admin_adjust_target, AdminAdjustFlow.target_user)
     dp.message.register(admin_adjust_amount, AdminAdjustFlow.amount)
+    dp.message.register(email_otp_select_order, EmailOtpFlow.order_id)
+    dp.message.register(email_otp_submit, EmailOtpFlow.otp)
     dp.callback_query.register(confirm, F.data == "order_confirm", CreateFlow.confirm)
     dp.callback_query.register(cancel, F.data == "order_cancel")
     dp.callback_query.register(admin_stats, F.data == "admin_stats")
