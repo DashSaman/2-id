@@ -1,0 +1,92 @@
+name: twoid
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: twoid_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: twoid
+      POSTGRES_USER: twoid
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - twoid_postgres_data:/var/lib/postgresql/data
+    networks:
+      - twoid_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U twoid -d twoid"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  api:
+    build: .
+    image: twoid_app:local
+    container_name: twoid_api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://twoid:${POSTGRES_PASSWORD}@postgres:5432/twoid
+      API_BIND: 0.0.0.0
+      API_PORT: 8000
+    command: ["sh", "-c", "alembic upgrade head && python -m app.api_server"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:18220:8000"
+    networks:
+      - twoid_internal
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  worker:
+    image: twoid_app:local
+    container_name: twoid_worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://twoid:${POSTGRES_PASSWORD}@postgres:5432/twoid
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - twoid_internal
+    logging: *logging
+
+  bot:
+    image: twoid_app:local
+    container_name: twoid_bot
+    restart: unless-stopped
+    profiles: ["bot"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://twoid:${POSTGRES_PASSWORD}@postgres:5432/twoid
+    command: ["python", "-m", "app.bot"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - twoid_internal
+    logging: *logging
+
+networks:
+  twoid_internal:
+    name: twoid_internal
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.235.0/24
+
+volumes:
+  twoid_postgres_data:
+    name: twoid_postgres_data
